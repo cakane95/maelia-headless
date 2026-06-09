@@ -220,21 +220,25 @@ __marimo__/
 .project
 .settings/
 
-# Experiments and logs
-logs/
-results/
-results_gama/
-results_python/
-backend_runtime_comparison/
-summary/
-*.npy
-*.csv
+gama_models/**/models/main/log/
 
 # Figs
 figures/
 *.png
 *.jpg
 *.pdf
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Docker / local volumes
+*.pid
+
+# Local editor
+.vscode/
+.idea/
 
 # Local OS files
 .DS_Store
