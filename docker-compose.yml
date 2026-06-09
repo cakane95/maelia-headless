@@ -1,0 +1,41 @@
+services:
+  gama-headless:
+    image: gamaplatform/gama:2025.06.4
+    container_name: maelia.headless
+    ports:
+      - "6868:6868"
+    volumes:
+      - ./gama_models:/usr/lib/gama/workspace/gama_models
+    command: -socket 6868
+  
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: maelia.backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - gama-headless
+    environment:
+      - GAMA_HOST=gama-headless
+      - GAMA_PORT=6868
+      - MAELIA_MODEL_PATH=/usr/lib/gama/workspace/gama_models/MAELIA_1.4.29_GAMA_2025-06/models/main/launcherSasseme.gaml
+      - MAELIA_EXPERIMENT_NAME=simulationBase
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: maelia.frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+
