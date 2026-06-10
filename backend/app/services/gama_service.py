@@ -1,5 +1,11 @@
 import asyncio
 from typing import Any
+from pathlib import Path
+import shutil
+import tempfile
+import zipfile
+
+from fastapi import UploadFile
 
 from gama_client.message_types import MessageTypes
 from gama_client.sync_client import GamaSyncClient
@@ -12,6 +18,10 @@ experiment_id: str | None = None
 
 eau_sol_series: list[dict[str, Any]] = []
 azote_perdu_series: list[dict[str, Any]] = []
+stress_hydrique_series: list[dict[str, Any]] = []
+soc_series: list[dict[str, Any]] = []
+qn_demande_series: list[dict[str, Any]] = []
+emissions_ges_series: list[dict[str, Any]] = []
 
 sampling_task: asyncio.Task | None = None
 sampling_enabled: bool = False
@@ -19,15 +29,103 @@ sampling_enabled: bool = False
 simulation_ended: bool = False
 simulation_finishing: bool = False
 simulation_status_message: str | None = None
+simulation_output_dir: str | None = None
+
+def _resolve_simulation_output_dir(relative_path: str) -> str:
+    model_dir = Path(settings.MAELIA_MODEL_PATH).parent
+
+    output_dir = (model_dir / relative_path).resolve()
+
+    return str(output_dir)
+
+def upload_includes_zip(territory: str, zip_file: UploadFile) -> dict[str, Any]:
+    territory = territory.strip()
+
+    if not territory:
+        raise RuntimeError("Territory name is required.")
+
+    if territory.startswith("includes_"):
+        includes_name = territory
+    else:
+        includes_name = f"includes_{territory}"
+
+    if not zip_file.filename or not zip_file.filename.endswith(".zip"):
+        raise RuntimeError("The uploaded file must be a .zip file.")
+
+    includes_root = (
+        Path(settings.MAELIA_MODEL_PATH)
+        .parents[2]
+        / "includes"
+    )
+
+    target_dir = includes_root / includes_name
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        zip_path = tmp_dir / zip_file.filename
+
+        with zip_path.open("wb") as buffer:
+            shutil.copyfileobj(zip_file.file, buffer)
+
+        if not zipfile.is_zipfile(zip_path):
+            raise RuntimeError("The uploaded file is not a valid zip archive.")
+
+        extract_dir = tmp_dir / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+
+        extracted_items = list(extract_dir.iterdir())
+
+        if len(extracted_items) == 1 and extracted_items[0].is_dir():
+            source_dir = extracted_items[0]
+        else:
+            source_dir = extract_dir
+
+        if not source_dir.name.startswith("includes_"):
+            # Si le zip contient directement les fichiers sans dossier racine,
+            # on accepte quand même et on les place dans includes_<territoire>.
+            source_name_is_valid = source_dir == extract_dir
+        else:
+            source_name_is_valid = True
+
+        if not source_name_is_valid:
+            raise RuntimeError("The includes folder name must start with 'includes_'.")
+
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+
+        shutil.copytree(source_dir, target_dir)
+
+    return {
+        "status": "success",
+        "message": "Includes folder uploaded successfully.",
+        "territory": territory,
+        "includes_name": includes_name,
+        "target_dir": str(target_dir),
+    }
 
 
 async def _gama_message_handler(message: dict) -> None:
-    global simulation_finishing
+    global simulation_finishing, simulation_output_dir
+
+    print("message received from server: ", message)
 
     content = message.get("content", {})
 
     if isinstance(content, dict):
         msg = content.get("message", "")
+
+        if "cheminRelatifDuDossierDeSortieDeSimulation:" in msg:
+            relative_path = msg.split(
+                "cheminRelatifDuDossierDeSortieDeSimulation:",
+                1,
+            )[1].strip()
+
+            simulation_output_dir = _resolve_simulation_output_dir(relative_path)
+
+            print("Simulation output dir:", simulation_output_dir)
 
         if "FIN DE SIMULATION" in msg and not simulation_finishing:
             simulation_finishing = True
@@ -103,6 +201,30 @@ def sample_realtime_metrics() -> dict[str, Any]:
         timeout=120.0,
     )
 
+    stress_hydrique_response = gama.expression(
+        exp_id,
+        "mean(list(cultureAqYieldNC) collect each.indiceSatifactionHydrique)",
+        timeout=120.0,
+    )
+
+    soc_response = gama.expression(
+        exp_id,
+        "parcelleAqYieldNC(first(listeParcelles)).SOC_perc",
+        timeout=120.0,
+    )
+
+    qn_demande_response = gama.expression(
+        exp_id,
+        "first(list(cultureAqYieldNC) collect each.sommeTranspirationR)",
+        timeout=120.0,
+    )
+
+    emissions_ges_response = gama.expression(
+        exp_id,
+        "parcelleAqYieldNC(first(listeParcelles)).sorties_bilan_net_GES",
+        timeout=120.0,
+    )
+
     cycle = cycle_response["content"]
 
     eau_sol_series.append(
@@ -116,6 +238,34 @@ def sample_realtime_metrics() -> dict[str, Any]:
         {
             "cycle": cycle,
             "nlosses": nlosses_response["content"],
+        }
+    )
+
+    stress_hydrique_series.append(
+        {
+            "cycle": cycle,
+            "stressHydrique": stress_hydrique_response["content"],
+        }
+    )
+
+    soc_series.append(
+        {
+            "cycle": cycle,
+            "socPerc": soc_response["content"],
+        }
+    )
+
+    qn_demande_series.append(
+        {
+            "cycle": cycle,
+            "qn": qn_demande_response["content"],
+        }
+    )
+
+    emissions_ges_series.append(
+        {
+            "cycle": cycle,
+            "bilanGes": emissions_ges_response["content"],
         }
     )
 
@@ -162,11 +312,17 @@ def stop_sampling() -> None:
     sampling_enabled = False
 
 
-def load_maelia() -> dict[str, Any]:
+def load_maelia(payload: Any | None = None) -> dict[str, Any]:  
+    parameters = payload.parameters if payload and payload.parameters else []
+    print("GAMA load parameters:", parameters)
+
     global experiment_id
     global simulation_ended, simulation_finishing, simulation_status_message
     global eau_sol_series, azote_perdu_series
+    global stress_hydrique_series, soc_series
+    global qn_demande_series, emissions_ges_series
     global sampling_task, sampling_enabled
+    global simulation_output_dir
 
     stop_sampling()
 
@@ -177,15 +333,21 @@ def load_maelia() -> dict[str, Any]:
     simulation_ended = False
     simulation_finishing = False
     simulation_status_message = None
+    simulation_output_dir = None
 
     eau_sol_series = []
     azote_perdu_series = []
+    stress_hydrique_series = []
+    soc_series = []
+    qn_demande_series = []
+    emissions_ges_series = []
 
     gama = _get_client()
 
     response = gama.load(
         settings.MAELIA_MODEL_PATH,
         settings.MAELIA_EXPERIMENT_NAME,
+        parameters=parameters,
         timeout=120.0,
     )
 
@@ -298,10 +460,15 @@ def get_simulation_state() -> dict[str, Any]:
 def get_realtime_series() -> dict[str, Any]:
     eau_sol_data = _deduplicate(eau_sol_series)
     azote_perdu_data = _deduplicate(azote_perdu_series)
+    stress_hydrique_data = _deduplicate(stress_hydrique_series)
+    soc_data = _deduplicate(soc_series)
+    qn_demande_data = _deduplicate(qn_demande_series)
+    emissions_ges_data = _deduplicate(emissions_ges_series)
 
     return {
         "simulation_ended": simulation_ended,
         "simulation_status_message": simulation_status_message,
+        "simulation_output_available": simulation_output_dir is not None,
         "eauSol": {
             "title": "Eau dans le sol",
             "description": "Évolution de Hm pour la première parcelle.",
@@ -332,4 +499,87 @@ def get_realtime_series() -> dict[str, Any]:
             "count": len(azote_perdu_data),
             "data": azote_perdu_data,
         },
+        "stressHydrique": {
+            "title": "Stress hydrique",
+            "description": "Évolution du stress hydrique moyen des cultures.",
+            "xKey": "cycle",
+            "series": [
+                {
+                    "key": "stressHydrique",
+                    "label": "Stress hydrique",
+                    "unit": "déficit de transpi.",
+                    "color": "#2563eb",
+                }
+            ],
+            "count": len(stress_hydrique_data),
+            "data": stress_hydrique_data,
+        },
+        "soc": {
+            "title": "SOC %",
+            "description": "Évolution du carbone organique du sol pour la première parcelle.",
+            "xKey": "cycle",
+            "series": [
+                {
+                    "key": "socPerc",
+                    "label": "SOC",
+                    "unit": "%",
+                    "color": "#A52A2A",
+                }
+            ],
+            "count": len(soc_data),
+            "data": soc_data,
+        },
+        "qnDemande": {
+            "title": "QNdemande",
+            "description": "Évolution de QN pour la première culture.",
+            "xKey": "cycle",
+            "series": [
+                {
+                    "key": "qn",
+                    "label": "QN",
+                    "unit": "",
+                    "color": "#2563eb",
+                }
+            ],
+            "count": len(qn_demande_data),
+            "data": qn_demande_data,
+        },
+        "emissionsGes": {
+            "title": "Émissions GES",
+            "description": "Évolution du bilan net de GES pour la première parcelle.",
+            "xKey": "cycle",
+            "series": [
+                {
+                    "key": "bilanGes",
+                    "label": "Bilan net de GES",
+                    "unit": "kgeqCO2/ha",
+                    "color": "#92400e",
+                }
+            ],
+            "count": len(emissions_ges_data),
+            "data": emissions_ges_data,
+        },
     }
+
+def create_outputs_zip() -> Path:
+    if simulation_output_dir is None:
+        raise RuntimeError("No simulation output directory is available.")
+
+    output_dir = Path(simulation_output_dir)
+
+    if not output_dir.exists():
+        raise RuntimeError(f"Simulation output directory does not exist: {simulation_output_dir}")
+
+    if not output_dir.is_dir():
+        raise RuntimeError(f"Simulation output path is not a directory: {simulation_output_dir}")
+
+    tmp_dir = Path(tempfile.gettempdir())
+    zip_base = tmp_dir / "maelia_outputs"
+
+    zip_path = shutil.make_archive(
+        base_name=str(zip_base),
+        format="zip",
+        root_dir=str(output_dir),
+    )
+
+    return Path(zip_path)

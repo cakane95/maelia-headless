@@ -222,6 +222,14 @@ __marimo__/
 
 gama_models/**/models/main/log/
 
+# Uploaded/generated MAELIA includes folders
+gama_models/**/includes/includes_*/
+gama_models/**/includes/terrainTest/
+
+# Keep reference territory if needed
+!gama_models/**/includes/includes_sasseme/
+!gama_models/**/includes/includes_sasseme/**
+
 # Figs
 figures/
 *.png

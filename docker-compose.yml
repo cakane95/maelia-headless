@@ -24,6 +24,7 @@ services:
       - MAELIA_EXPERIMENT_NAME=simulationBase
     volumes:
       - ./backend:/app
+      - ./gama_models:/usr/lib/gama/workspace/gama_models
 
   frontend:
     build:
